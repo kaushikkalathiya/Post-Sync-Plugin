@@ -342,8 +342,169 @@ class Post_Sync_Plugin
         // Only sync posts
         $host_post_id = intval($data['host_post_id']);
 
+        try {
+            $lang = $opts['translation_lang'] ?? 'fr';
+            $chatgpt_key = $opts['chatgpt_key'] ?? '';
+
+            $translated_title = $this->translate_html_chunks($data['title'] ?? '', $lang, $chatgpt_key);
+            $translated_content = $this->translate_html_chunks($data['content'] ?? '', $lang, $chatgpt_key);
+            $translated_excerpt = $this->translate_html_chunks($data['excerpt'] ?? '', $lang, $chatgpt_key);
+
+            // Find existing mapping
+            $existing = get_posts(array(
+                'post_type' => 'post',
+                'meta_key' => '_psp_host_post_id',
+                'meta_value' => $host_post_id,
+                'posts_per_page' => 1,
+            ));
+
+            $post_arr = array(
+                'post_title' => wp_strip_all_tags($translated_title),
+                'post_content' => $translated_content,
+                'post_excerpt' => wp_strip_all_tags($translated_excerpt),
+                'post_status' => 'publish',
+                'post_type' => 'post',
+            );
+
+            if (!empty($existing)) {
+                $post_arr['ID'] = $existing[0]->ID;
+                $target_post_id = wp_update_post($post_arr, true);
+            } else {
+                $target_post_id = wp_insert_post($post_arr, true);
+            }
+
+            if (is_wp_error($target_post_id)) {
+                throw new Exception('Post insert/update error: ' . $target_post_id->get_error_message());
+            }
+
+            // Set meta mapping
+            update_post_meta($target_post_id, '_psp_host_post_id', $host_post_id);
+
+            // Categories
+            if (!empty($data['categories']) && is_array($data['categories'])) {
+                $cat_ids = array();
+                foreach ($data['categories'] as $cname) {
+                    $term = get_term_by('name', $cname, 'category');
+                    if (!$term) {
+                        $term = wp_insert_term($cname, 'category');
+                        if (!is_wp_error($term) && isset($term['term_id'])) $cat_ids[] = intval($term['term_id']);
+                    } else {
+                        $cat_ids[] = intval($term->term_id);
+                    }
+                }
+                if (!empty($cat_ids)) wp_set_post_categories($target_post_id, $cat_ids);
+            }
+
+            // Tags
+            if (!empty($data['tags']) && is_array($data['tags'])) {
+                wp_set_post_tags($target_post_id, $data['tags']);
+            }
+
+            // Featured image
+            if (!empty($data['featured_image'])) {
+                require_once(ABSPATH . 'wp-admin/includes/media.php');
+                require_once(ABSPATH . 'wp-admin/includes/file.php');
+                require_once(ABSPATH . 'wp-admin/includes/image.php');
+                $img = media_sideload_image($data['featured_image'], $target_post_id, null, 'id');
+                if (!is_wp_error($img) && $img) {
+                    set_post_thumbnail($target_post_id, $img);
+                }
+            }
+
+            $time_taken = microtime(true) - $start;
+            $this->insert_log('target', 'sync', $host_post_id, $target_post_id, $_SERVER['REMOTE_ADDR'] ?? '', 'success', 'Synced', $time_taken);
+
+            return new WP_REST_Response(array('success' => true, 'target_post_id' => $target_post_id), 200);
+        } catch (Exception $e) {
+            $time_taken = microtime(true) - $start;
+            $this->insert_log('target', 'sync', $host_post_id, null, $_SERVER['REMOTE_ADDR'] ?? '', 'failed', $e->getMessage(), $time_taken);
+            return new WP_REST_Response(array('success' => false, 'message' => $e->getMessage()), 500);
+        }
     }
 
+    private function translate_html_chunks($html, $lang, $chatgpt_key)
+    {
+        // If no key provided, skip translation and return original
+        if (empty($chatgpt_key)) return $html;
+
+        // Split into blocks by common block-level boundaries while keeping delimiters
+        $pieces = preg_split('/(<\/p>|<br\s*\/?>|<\/div>|<\/li>)/i', $html, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY);
+
+        // Recombine to chunks approx 1800-2300 chars
+        $chunks = array();
+        $current = '';
+        foreach ($pieces as $part) {
+            $current .= $part;
+            if (mb_strlen($current) > 2000) {
+                $chunks[] = $current;
+                $current = '';
+            }
+        }
+        if (strlen($current) > 0) $chunks[] = $current;
+
+        $translated = '';
+        foreach ($chunks as $chunk) {
+            $t = $this->translate_via_chatgpt($chunk, $lang, $chatgpt_key);
+            // Fallback to original chunk if translation failed
+            if ($t === false) $t = $chunk;
+            $translated .= $t;
+        }
+        return $translated;
+    }
+
+    private function translate_via_chatgpt($html_fragment, $lang, $chatgpt_key)
+    {
+        $system = "You are an expert translator. Translate the user's HTML fragment into $lang while preserving all HTML tags, attributes, and structure. Do not add extra text or explanations — only return the translated HTML fragment. Keep URLs, code, and inline HTML intact.";
+
+        $messages = array(
+            array('role' => 'system', 'content' => $system),
+            array('role' => 'user', 'content' => $html_fragment),
+        );
+
+        $body = array(
+            'model' => 'gpt-3.5-turbo',
+            'messages' => $messages,
+            'temperature' => 0.0,
+        );
+
+        $resp = wp_remote_post('https://api.openai.com/v1/chat/completions', array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $chatgpt_key,
+                'Content-Type' => 'application/json',
+            ),
+            'body' => wp_json_encode($body),
+            'timeout' => 30,
+        ));
+
+        if (is_wp_error($resp)) return false;
+        $code = wp_remote_retrieve_response_code($resp);
+        $b = wp_remote_retrieve_body($resp);
+        $data = json_decode($b, true);
+        if ($code >= 200 && $code < 300 && isset($data['choices'][0]['message']['content'])) {
+            return $data['choices'][0]['message']['content'];
+        }
+        return false;
+    }
+
+   
+
+    /* ---------------------- Logging ---------------------- */
+    private function insert_log($site_role, $action, $host_post_id, $target_post_id, $target_url, $status, $message, $time_taken)
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . self::LOG_TABLE;
+        $wpdb->insert($table, array(
+            'site_role' => $site_role,
+            'action' => $action,
+            'host_post_id' => $host_post_id,
+            'target_post_id' => $target_post_id,
+            'target_url' => $target_url,
+            'status' => $status,
+            'message' => $message,
+            'time_taken' => $time_taken,
+            'created_at' => current_time('mysql'),
+        ));
+    }
 
     private function get_options()
     {
