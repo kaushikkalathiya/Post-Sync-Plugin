@@ -13,6 +13,11 @@ class Post_Sync_Plugin
     {
         add_action('admin_menu', array($this, 'admin_menu'));
         add_action('admin_init', array($this, 'register_settings'));
+        // Host hooks
+        add_action('publish_post', array($this, 'handle_post_publish'), 10, 2);
+        add_action('post_updated', array($this, 'handle_post_update'), 10, 3);
+        // REST for target
+        add_action('rest_api_init', array($this, 'register_rest_routes'));
         register_activation_hook(__FILE__, array($this, 'activate'));
     }
 
@@ -167,6 +172,178 @@ class Post_Sync_Plugin
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
         dbDelta($sql);
     }
+
+    /* ---------------------- Host side ---------------------- */
+    public function handle_post_publish($post_ID, $post)
+    {
+        $this->maybe_push_post($post_ID, $post, 'publish');
+    }
+
+    public function handle_post_update($post_ID, $post_after, $post_before)
+    {
+        // Only handle posts
+        if ($post_after->post_type !== 'post') return;
+        $this->maybe_push_post($post_ID, $post_after, 'update');
+    }
+
+    private function maybe_push_post($post_ID, $post, $action)
+    {
+        $opts = $this->get_options();
+        if ($opts['mode'] !== 'host') return;
+        if ($post->post_status !== 'publish' && $action === 'publish') return;
+
+        $targets = is_array($opts['targets']) ? $opts['targets'] : array();
+        if (empty($targets)) return;
+
+        $payload = $this->build_post_payload($post_ID);
+
+        foreach ($targets as $t) {
+            $target_url = rtrim($t['url'], '/') . '/wp-json/psp/v1/sync';
+            $key = $t['key'] ?? '';
+            $start = microtime(true);
+            $res = $this->send_to_target($target_url, $key, $payload);
+            $time = microtime(true) - $start;
+            $status = isset($res['success']) && $res['success'] ? 'success' : 'failed';
+            $message = isset($res['message']) ? $res['message'] : (is_array($res) ? json_encode($res) : strval($res));
+            $this->insert_log('host', $action, $post_ID, $res['target_post_id'] ?? null, $target_url, $status, $message, $time);
+            // Save mapping on host when success
+            if (!empty($res['success']) && $res['success'] && !empty($res['target_post_id'])) {
+                $this->save_mapping($post_ID, $target_url, $res['target_post_id']);
+            }
+        }
+    }
+
+    private function save_mapping($host_post_id, $target_url, $target_post_id)
+    {
+        $maps = get_option('psp_mappings', array());
+        if (!isset($maps[$host_post_id]) || !is_array($maps[$host_post_id])) $maps[$host_post_id] = array();
+        $maps[$host_post_id][$target_url] = $target_post_id;
+        update_option('psp_mappings', $maps);
+    }
+
+    private function build_post_payload($post_ID)
+    {
+        $post = get_post($post_ID);
+        if (!$post) return array();
+
+        // Get categories and tags
+        $cats = wp_get_post_categories($post_ID, array('fields' => 'names'));
+        $tags = wp_get_post_tags($post_ID, array('fields' => 'names'));
+
+        // Featured image
+        $thumb_id = get_post_thumbnail_id($post_ID);
+        $thumb_url = $thumb_id ? wp_get_attachment_url($thumb_id) : '';
+
+        return array(
+            'host_site' => home_url(),
+            'host_post_id' => $post_ID,
+            'title' => $post->post_title,
+            'content' => $post->post_content,
+            'excerpt' => $post->post_excerpt,
+            'categories' => $cats,
+            'tags' => $tags,
+            'featured_image' => $thumb_url,
+            'modified' => $post->post_modified,
+        );
+    }
+
+    private function send_to_target($url, $key, $payload)
+    {
+        if (empty($key) || empty($url)) {
+            return array('success' => false, 'message' => 'Missing key or url');
+        }
+
+        $body = wp_json_encode($payload);
+        $timestamp = time();
+        $signature = hash_hmac('sha256', $body . '|' . $timestamp, $key);
+
+        $args = array(
+            'headers' => array(
+                'Content-Type' => 'application/json',
+                'X-PSP-Key' => $key,
+                'X-PSP-Timestamp' => $timestamp,
+                'X-PSP-Signature' => $signature,
+            ),
+            'body' => $body,
+            'timeout' => 30,
+        );
+
+        $resp = wp_remote_post($url, $args);
+        if (is_wp_error($resp)) {
+            return array('success' => false, 'message' => $resp->get_error_message());
+        }
+        $code = wp_remote_retrieve_response_code($resp);
+        $body = wp_remote_retrieve_body($resp);
+        $data = json_decode($body, true);
+        return array_merge(array('http_code' => $code, 'success' => $code >= 200 && $code < 300), is_array($data) ? $data : array('message' => $body));
+    }
+
+
+    /* ---------------------- REST / Target side ---------------------- */
+    public function register_rest_routes()
+    {
+        register_rest_route('psp/v1', '/sync', array(
+            'methods' => 'POST',
+            'callback' => array($this, 'rest_sync_post'),
+            'permission_callback' => '__return_true',
+        ));
+    }
+
+    public function rest_sync_post(
+        WP_REST_Request $request
+    ) {
+        $start = microtime(true);
+        $opts = $this->get_options();
+        if ($opts['mode'] !== 'target') {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Site not in target mode'), 400);
+        }
+
+        $provided_key = $request->get_header('x-psp-key');
+        $timestamp = $request->get_header('x-psp-timestamp');
+        $signature = $request->get_header('x-psp-signature');
+        $body = $request->get_body();
+
+        if (empty($provided_key) || empty($timestamp) || empty($signature)) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Missing auth headers'), 401);
+        }
+
+        // Validate key matches configured key
+        $local_key = $opts['target_key'];
+        if ($provided_key !== $local_key) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Invalid key'), 403);
+        }
+
+        // Timestamp freshness (5 minutes)
+        if (abs(time() - intval($timestamp)) > 300) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Stale timestamp'), 403);
+        }
+
+        $calc = hash_hmac('sha256', $body . '|' . $timestamp, $local_key);
+        if (!hash_equals($calc, $signature)) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Invalid signature'), 403);
+        }
+
+        $data = json_decode($body, true);
+        if (!$data || empty($data['host_post_id'])) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Invalid payload'), 400);
+        }
+
+        // Domain binding: if configured, ensure host matches
+        $allowed_host = $opts['allowed_host'] ?? '';
+        if (!empty($allowed_host)) {
+            $incoming_host = $data['host_site'] ?? '';
+            $allowed_host_host = parse_url(rtrim($allowed_host, '/'), PHP_URL_HOST) ?: rtrim($allowed_host, '/');
+            $incoming_host_host = parse_url(rtrim($incoming_host, '/'), PHP_URL_HOST) ?: rtrim($incoming_host, '/');
+            if (strtolower($allowed_host_host) !== strtolower($incoming_host_host)) {
+                return new WP_REST_Response(array('success' => false, 'message' => 'Host mismatch'), 403);
+            }
+        }
+
+        // Only sync posts
+        $host_post_id = intval($data['host_post_id']);
+
+    }
+
 
     private function get_options()
     {
