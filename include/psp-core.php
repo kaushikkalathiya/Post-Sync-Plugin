@@ -151,7 +151,7 @@ class Post_Sync_Plugin
         return $input;
     }
 
-     public function activate()
+    public function activate()
     {
         global $wpdb;
         $table_name = $wpdb->prefix . self::LOG_TABLE;
@@ -278,7 +278,6 @@ class Post_Sync_Plugin
         return array_merge(array('http_code' => $code, 'success' => $code >= 200 && $code < 300), is_array($data) ? $data : array('message' => $body));
     }
 
-
     /* ---------------------- REST / Target side ---------------------- */
     public function register_rest_routes()
     {
@@ -289,9 +288,7 @@ class Post_Sync_Plugin
         ));
     }
 
-    public function rest_sync_post(
-        WP_REST_Request $request
-    ) {
+    public function rest_sync_post(WP_REST_Request $request) {
         $start = microtime(true);
         $opts = $this->get_options();
         if ($opts['mode'] !== 'target') {
@@ -486,7 +483,7 @@ class Post_Sync_Plugin
         return false;
     }
 
-   
+
 
     /* ---------------------- Logging ---------------------- */
     private function insert_log($site_role, $action, $host_post_id, $target_post_id, $target_url, $status, $message, $time_taken)
